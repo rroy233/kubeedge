@@ -23,7 +23,7 @@ permissions:
 
 env:
   KUBEEDGE_VERSION_TAG: v1.22.2
-  ARTIFACT_VERSION: v1.22.2-fix
+  ARTIFACT_VERSION: v1.22.2-fix2
 
 jobs:
   build:
