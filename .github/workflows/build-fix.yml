@@ -49,7 +49,21 @@ jobs:
             echo "补丁缺失：handler 仍在用 metaclient.KubeClient（HTTPS 自回环）" >&2
             exit 1
           fi
-          echo "补丁校验通过：$(git log --oneline -1)"
+          echo "unhold 补丁校验通过"
+
+          # SA token 补丁（backport kubeedge#6828）：edgecore 重启/分区期间不再因删本地 token 行
+          # 而恒久 401。校验三处关键改动在位。
+          sa=edge/pkg/metamanager/client/serviceaccount.go
+          grep -q 'func baseKey(' "$sa"
+          grep -q 'QueryMetaByKeyPrefix' "$sa"
+          grep -q 'func RunExpiredTokenGC(' "$sa"
+          if grep -q 'dao.DeleteMetaByKey(resKey)' "$sa"; then
+            echo "SA token 补丁缺失：getTokenLocally 仍在刷新时删除本地 token 行（恒久 401 根因）" >&2
+            exit 1
+          fi
+          grep -q 'QueryMetaByKeyPrefix' edge/pkg/metamanager/dao/meta.go
+          grep -q 'client.RunExpiredTokenGC' edge/pkg/metamanager/metamanager.go
+          echo "SA token 补丁校验通过：$(git log --oneline -1)"
 
       - name: 构建（native amd64 + cgo）
         env:

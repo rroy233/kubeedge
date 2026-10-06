@@ -86,8 +86,12 @@ func requiresRefresh(tr *authenticationv1.TokenRequest) bool {
 	return false
 }
 
-// KeyFunc keys should be nonconfidential and safe to log
-func KeyFunc(name, namespace string, tr *authenticationv1.TokenRequest) string {
+// baseKey is the spec-derived key prefix that identifies the logical token
+// (independent of which generation). All generations of the same logical token
+// share this prefix. Used for prefix lookup in metaDB.
+//
+// 这是 v1.22.2 原 KeyFunc 的函数体，拆出来专门做前缀。keys 不含机密，可安全打日志。
+func baseKey(name, namespace string, tr *authenticationv1.TokenRequest) string {
 	var exp int64
 	if tr.Spec.ExpirationSeconds != nil {
 		exp = *tr.Spec.ExpirationSeconds
@@ -101,33 +105,78 @@ func KeyFunc(name, namespace string, tr *authenticationv1.TokenRequest) string {
 	return fmt.Sprintf("%q/%q/%#v/%#v/%#v", name, namespace, tr.Spec.Audiences, exp, ref)
 }
 
+// KeyFunc returns the per-generation storage key for a TokenRequest. The key is
+// the base (spec-derived) key suffixed with the token's expiration timestamp so
+// that successive refreshed tokens for the same logical token are stored as
+// separate rows.
+//
+// 为什么要按世代分键（backport 自 kubeedge#6828）：MetaServer 用「DB 里是否存在该 token」
+// 做认证（CheckTokenExist）。v1.22.2 原实现在 token 到达刷新阈值时**先删本地行再去云端取新的**，
+// 一旦此刻处于分区（RQ3 的 edgecore-restart-during-partition 场景）或重连瞬间，远端取不到，
+// 本地行就永久消失 → 之后 Pod 带着任一 token 来都认证失败（tokenData not found，恒久 401）。
+// 改为「新旧世代各自一行、刷新窗口内并存」后，旧 token 在传播窗口内仍可通过认证；过期行由
+// RunExpiredTokenGC 清理。
+//
+// 写入侧（process.go 的 parseResource）与读取侧（getTokenLocally 前缀查询）共用本函数：
+// 写入用完整世代键落行，读取用 baseKey 前缀一次取回同一逻辑 token 的所有世代。
+//
+// keys 不含机密，可安全打日志。
+func KeyFunc(name, namespace string, tr *authenticationv1.TokenRequest) string {
+	base := baseKey(name, namespace, tr)
+	if tr.Status.ExpirationTimestamp.IsZero() {
+		// 防御：没有 exp 的写入是异常数据。回退到 base（退化成 v1.22.2 的「一个逻辑 token 一行、
+		// 刷新即覆盖」行为），不比原来更糟。正常写入路径的 token 响应都带 Status.ExpirationTimestamp。
+		return base
+	}
+	return fmt.Sprintf("%s/%d", base, tr.Status.ExpirationTimestamp.UnixNano())
+}
+
 func getTokenLocally(name, namespace string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
-	resKey := KeyFunc(name, namespace, tr)
-	metas, err := dao.QueryMeta("key", resKey)
+	prefix := baseKey(name, namespace, tr)
+	// 前缀查询一次取回同一逻辑 token 的所有世代（也兼容升级前写入的「无 exp 后缀」旧行：
+	// LIKE 'base%' 同样命中 base 本身）。
+	metas, err := dao.QueryMetaByKeyPrefix(prefix)
 	if err != nil {
-		klog.Errorf("query meta %s failed: %v", resKey, err)
+		klog.Errorf("query meta by prefix %s failed: %v", prefix, err)
 		return nil, err
 	}
-	if len(*metas) != 1 {
-		klog.Errorf("query meta %s length error", resKey)
-		return nil, fmt.Errorf("query meta %s length error", resKey)
+	if metas == nil || len(*metas) == 0 {
+		return nil, fmt.Errorf("no cached token for %s", prefix)
 	}
-	var tokenRequest authenticationv1.TokenRequest
-	err = json.Unmarshal([]byte((*metas)[0]), &tokenRequest)
-	if err != nil {
-		klog.Errorf("unmarshal resource %s token request failed: %v", resKey, err)
-		return nil, err
-	}
-	if requiresRefresh(&tokenRequest) {
-		err := dao.DeleteMetaByKey(resKey)
-		if err != nil {
-			klog.Errorf("delete meta %s failed: %v", resKey, err)
-			return nil, err
+
+	// 选出最新的未过期世代。更旧的世代可能仍在（刻意保留以覆盖刷新传播窗口，过期后由 GC 清理），
+	// 但要返回给调用方的是最新那一个。
+	now := time.Now()
+	var newest *authenticationv1.TokenRequest
+	for _, v := range *metas {
+		var cur authenticationv1.TokenRequest
+		if err := json.Unmarshal([]byte(v), &cur); err != nil {
+			klog.Errorf("unmarshal cached token under prefix %s failed: %v", prefix, err)
+			continue
 		}
-		klog.Errorf("resource %s token expired", resKey)
-		return nil, fmt.Errorf("resource %s token expired", resKey)
+		// 升级前的旧行可能没有 ExpirationTimestamp：此时无法判断是否过期，跳过它，
+		// 促使走远端刷新拿到带 exp 的新世代（而不是把一个无法判定寿命的 token 当作有效）。
+		if cur.Status.ExpirationTimestamp.IsZero() || !cur.Status.ExpirationTimestamp.Time.After(now) {
+			continue
+		}
+		if newest == nil || cur.Status.ExpirationTimestamp.Time.After(newest.Status.ExpirationTimestamp.Time) {
+			snapshot := cur
+			newest = &snapshot
+		}
 	}
-	return &tokenRequest, nil
+	if newest == nil {
+		return nil, fmt.Errorf("no un-expired cached token for %s", prefix)
+	}
+
+	if requiresRefresh(newest) {
+		// 最新世代已过刷新阈值（TTL 的 80%），触发远端刷新。
+		// **关键：这里不删除任何本地行**（这正是 v1.22.2 恒久 401 的根因修复）。刷新得到的
+		// 新 token 会以新的世代键写入（见 KeyFunc），新旧行在传播窗口内并存；过期行由
+		// RunExpiredTokenGC 清理。
+		klog.V(4).Infof("resource %s token requires refresh", prefix)
+		return nil, fmt.Errorf("resource %s token requires refresh", prefix)
+	}
+	return newest, nil
 }
 
 func getTokenRemotely(resource string, tr *authenticationv1.TokenRequest, c *serviceAccountToken) (*authenticationv1.TokenRequest, error) {
@@ -248,4 +297,53 @@ func CheckTokenExist(token string) bool {
 		}
 	}
 	return false
+}
+
+// RunExpiredTokenGC periodically scans all service-account token rows in metaDB
+// and deletes any whose Status.ExpirationTimestamp has passed.
+//
+// 为什么需要 GC（backport 自 kubeedge#6828）：刷新后的 token 以「每世代一个键」存储、不再覆盖
+// 旧世代（见 KeyFunc），过期世代因此会累积，必须在这里清掉。以 10 分钟 token TTL、80% 刷新阈值
+// 估算，单个逻辑 token 的稳态行数约为 2；下面的扫描间隔足够宽松。stopCh 关闭时退出。
+func RunExpiredTokenGC(stopCh <-chan struct{}, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			gcExpiredTokensOnce()
+		}
+	}
+}
+
+// gcExpiredTokensOnce 扫描一次 serviceaccounttoken 行，删除所有已过期（含无 exp 的异常行）的。
+func gcExpiredTokensOnce() {
+	rows, err := dao.QueryAllMeta("type", model.ResourceTypeServiceAccountToken)
+	if err != nil {
+		klog.Errorf("GC: query SA tokens failed: %v", err)
+		return
+	}
+	if rows == nil {
+		return
+	}
+	now := time.Now()
+	for _, m := range *rows {
+		var tr authenticationv1.TokenRequest
+		if err := json.Unmarshal([]byte(m.Value), &tr); err != nil {
+			klog.Errorf("GC: unmarshal SA token row %s failed: %v", m.Key, err)
+			continue
+		}
+		// 已过期即删除。无 exp 的异常行同样删除：它无法参与认证（getTokenLocally 会跳过它），
+		// 留着只会占行、并在重启后造成误导性的“有行却认证不过”。
+		if tr.Status.ExpirationTimestamp.IsZero() || !tr.Status.ExpirationTimestamp.Time.After(now) {
+			if err := dao.DeleteMetaByKey(m.Key); err != nil {
+				klog.Errorf("GC: delete expired SA token %s failed: %v", m.Key, err)
+			}
+		}
+	}
 }

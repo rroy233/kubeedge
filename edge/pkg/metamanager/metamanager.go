@@ -8,6 +8,7 @@ import (
 	"github.com/kubeedge/beehive/pkg/core"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
+	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 	metamanagerconfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/config"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao"
 	v2 "github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao/v2"
@@ -75,6 +76,10 @@ func (m *metaManager) Start() {
 		imitator.StorageInit()
 		go metaserver.NewMetaServer().Start(beehiveContext.Done())
 	}
+
+	// 周期清理过期的 SA token 世代行（backport 自 kubeedge#6828）。刷新后的 token 以每世代一行
+	// 存储、不再覆盖旧世代，过期行需由此 GC 回收；interval=0 时内部默认 1 分钟。
+	go client.RunExpiredTokenGC(beehiveContext.Done(), 0)
 
 	m.runMetaManager()
 }

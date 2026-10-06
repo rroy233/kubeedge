@@ -449,6 +449,9 @@ func TestDeleteServiceAccountToken(t *testing.T) {
 	sat.DeleteServiceAccountToken(podUID)
 }
 
+// TestGetTokenLocally 覆盖 backport（kubeedge#6828）后的本地读取语义：
+// 以 baseKey 前缀查询取回同一逻辑 token 的所有世代，返回最新未过期者；需要刷新时返回错误
+// 但**不删除任何本地行**（根因修复：避免分区/重启期间本地 token 行被清空而恒久 401）。
 func TestGetTokenLocally(t *testing.T) {
 	assert := assert.New(t)
 
@@ -459,11 +462,12 @@ func TestGetTokenLocally(t *testing.T) {
 			ExpirationSeconds: func() *int64 { i := int64(3600); return &i }(),
 		},
 	}
-	key := KeyFunc(name, namespace, tr)
+	prefix := baseKey(name, namespace, tr)
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
+	// 1) 命中一个未过期世代：正常返回，且前缀与 baseKey 一致。
 	validTR := &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
 			ExpirationSeconds: func() *int64 { i := int64(3600); return &i }(),
@@ -477,9 +481,8 @@ func TestGetTokenLocally(t *testing.T) {
 		t.Fatalf("Failed to marshal valid token request: %v", err)
 	}
 
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
-		assert.Equal("key", k)
-		assert.Equal(key, v)
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(p string) (*[]string, error) {
+		assert.Equal(prefix, p)
 		return &[]string{string(validTRBytes)}, nil
 	})
 
@@ -487,36 +490,37 @@ func TestGetTokenLocally(t *testing.T) {
 	assert.NoError(err)
 	assert.NotNil(result)
 
+	// 2) 查询出错：原样返回错误。
 	patches.Reset()
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(p string) (*[]string, error) {
 		return nil, errors.New("query meta error")
 	})
-
 	result, err = getTokenLocally(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
 	assert.Contains(err.Error(), "query meta error")
 
+	// 3) 没有任何缓存行：返回 no cached token。
 	patches.Reset()
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(p string) (*[]string, error) {
 		return &[]string{}, nil
 	})
-
 	result, err = getTokenLocally(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
-	assert.Contains(err.Error(), "query meta")
-	assert.Contains(err.Error(), "length error")
+	assert.Contains(err.Error(), "no cached token")
 
+	// 4) 行内容非法 JSON：被跳过，最终无可用世代。
 	patches.Reset()
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(p string) (*[]string, error) {
 		return &[]string{"invalid-json"}, nil
 	})
-
 	result, err = getTokenLocally(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
+	assert.Contains(err.Error(), "no un-expired cached token")
 
+	// 5) 只有已过期世代：返回 no un-expired，且**不触发任何删除**。
 	patches.Reset()
 	expiredTR := &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
@@ -530,34 +534,48 @@ func TestGetTokenLocally(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to marshal expired token request: %v", err)
 	}
-
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
+	deleteCalled := false
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(p string) (*[]string, error) {
 		return &[]string{string(expiredTRBytes)}, nil
 	})
-
 	patches.ApplyFunc(dao.DeleteMetaByKey, func(k string) error {
-		assert.Equal(key, k)
+		deleteCalled = true
 		return nil
 	})
-
 	result, err = getTokenLocally(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
-	assert.Contains(err.Error(), "token expired")
+	assert.Contains(err.Error(), "no un-expired cached token")
+	assert.False(deleteCalled, "getTokenLocally 不得删除本地 token 行（根因修复）")
 
+	// 6) 命中需要刷新的世代（临近过期）：返回 requires refresh，同样不删除本地行。
 	patches.Reset()
-	patches.ApplyFunc(dao.QueryMeta, func(k, v string) (*[]string, error) {
-		return &[]string{string(expiredTRBytes)}, nil
+	refreshTR := &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{
+			ExpirationSeconds: func() *int64 { i := int64(3600); return &i }(),
+		},
+		Status: authenticationv1.TokenRequestStatus{
+			// 10 分钟后过期，落在 20% TTL（12 分钟）窗口内 → requiresRefresh 为真。
+			ExpirationTimestamp: metav1.NewTime(time.Now().Add(10 * time.Minute)),
+		},
+	}
+	refreshTRBytes, err := json.Marshal(refreshTR)
+	if err != nil {
+		t.Fatalf("Failed to marshal refresh token request: %v", err)
+	}
+	deleteCalled = false
+	patches.ApplyFunc(dao.QueryMetaByKeyPrefix, func(p string) (*[]string, error) {
+		return &[]string{string(refreshTRBytes)}, nil
 	})
-
 	patches.ApplyFunc(dao.DeleteMetaByKey, func(k string) error {
-		return fmt.Errorf("failed to delete meta by key %s: deletion operation failed", k)
+		deleteCalled = true
+		return nil
 	})
-
 	result, err = getTokenLocally(name, namespace, tr)
 	assert.Error(err)
 	assert.Nil(result)
-	assert.Contains(err.Error(), "failed to delete meta")
+	assert.Contains(err.Error(), "requires refresh")
+	assert.False(deleteCalled, "刷新路径不得删除本地 token 行（根因修复）")
 }
 
 func TestGetServiceAccountToken(t *testing.T) {
@@ -745,4 +763,47 @@ func TestCheckTokenExist(t *testing.T) {
 	})
 
 	assert.False(CheckTokenExist("test-token"))
+}
+
+// TestGCExpiredTokensOnce 验证过期（及无 exp 的异常）世代行会被删除、未过期行保留。
+func TestGCExpiredTokensOnce(t *testing.T) {
+	assert := assert.New(t)
+
+	mk := func(key string, exp *time.Time) dao.Meta {
+		tr := authenticationv1.TokenRequest{
+			Spec: authenticationv1.TokenRequestSpec{
+				ExpirationSeconds: func() *int64 { i := int64(3600); return &i }(),
+			},
+		}
+		if exp != nil {
+			tr.Status.ExpirationTimestamp = metav1.NewTime(*exp)
+		}
+		b, _ := json.Marshal(tr)
+		return dao.Meta{Key: key, Type: model.ResourceTypeServiceAccountToken, Value: string(b)}
+	}
+	future := time.Now().Add(time.Hour)
+	past := time.Now().Add(-time.Hour)
+	rows := []dao.Meta{
+		mk("base/live", &future), // 未过期：保留
+		mk("base/dead", &past),   // 已过期：删除
+		mk("base/noexp", nil),    // 无 exp 异常行：删除
+	}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(dao.QueryAllMeta, func(k, v string) (*[]dao.Meta, error) {
+		assert.Equal("type", k)
+		assert.Equal(model.ResourceTypeServiceAccountToken, v)
+		return &rows, nil
+	})
+	var deleted []string
+	patches.ApplyFunc(dao.DeleteMetaByKey, func(k string) error {
+		deleted = append(deleted, k)
+		return nil
+	})
+
+	gcExpiredTokensOnce()
+
+	assert.ElementsMatch([]string{"base/dead", "base/noexp"}, deleted)
+	assert.NotContains(deleted, "base/live")
 }

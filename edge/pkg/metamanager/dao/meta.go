@@ -102,6 +102,27 @@ func QueryMeta(key string, condition string) (*[]string, error) {
 	return &result, nil
 }
 
+// QueryMetaByKeyPrefix return meta values whose Key starts with prefix.
+//
+// 为什么需要前缀查询：SA token 的刷新（PR kubeedge#6828 的 backport）把同一个逻辑 token 的
+// 不同世代以「基础键 + 过期时间戳」为键分行存储，刷新窗口内新旧两行并存。认证侧（MetaServer
+// CheckTokenExist）靠「DB 里是否存在该 token」判定，因此读取时必须用基础键做前缀匹配，
+// 一次取回同一逻辑 token 的所有世代，再挑最新未过期的那一个。
+func QueryMetaByKeyPrefix(prefix string) (*[]string, error) {
+	meta := new([]Meta)
+	// beego orm 的 __startswith 生成 `key LIKE 'prefix%'`，与 PR 原始实现语义一致。
+	_, err := dbm.DBAccess.QueryTable(MetaTableName).Filter("key__startswith", prefix).All(meta)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []string
+	for _, v := range *meta {
+		result = append(result, v.Value)
+	}
+	return &result, nil
+}
+
 // QueryAllMeta return all meta, if no error, Meta not null
 func QueryAllMeta(key string, condition string) (*[]Meta, error) {
 	meta := new([]Meta)
