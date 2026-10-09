@@ -54,7 +54,11 @@ func (f *Factory) UnholdUpgrade() http.Handler {
 		namespace, name := parts[0], parts[1]
 
 		// use kubeclient to get pod metadata
-		clientset, err := metaclient.KubeClient()
+		// 必须用 common.BearerTokenFromContext 而不是直接读 req 的 Authorization
+		// 头：认证中间件（genericapifilters.WithAuthentication）认证成功后会主动删除
+		// 该头（k8s.io/apiserver 标准安全行为），所以这里只能从 captureBearerToken
+		// 中间件预先存进 context 的副本里取（见 metaserver/server.go）。
+		clientset, err := metaclient.KubeClientWithToken(common.BearerTokenFromContext(ctx))
 		if err != nil {
 			http.Error(w, fmt.Sprintf("cannot init kube client: %v", err), http.StatusInternalServerError)
 			return
@@ -104,7 +108,7 @@ func (f *Factory) UnholdUpgradeNode() http.Handler {
 			return
 		}
 
-		clientset, err := metaclient.KubeClient()
+		clientset, err := metaclient.KubeClientWithToken(common.BearerTokenFromContext(ctx))
 		if err != nil {
 			http.Error(w, fmt.Sprintf("cannot init kube client: %v", err), http.StatusInternalServerError)
 			return

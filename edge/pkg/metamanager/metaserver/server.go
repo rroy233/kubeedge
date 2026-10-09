@@ -38,6 +38,7 @@ import (
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/auth"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/certificate"
+	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/common"
 	metaserverconfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/config"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/handlerfactory"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/kubernetes/serializer"
@@ -235,6 +236,12 @@ func BuildHandlerChain(handler http.Handler, ls *MetaServer) http.Handler {
 		handler = genericapifilters.WithAuthorization(handler, ls.Auth.Authorizer, legacyscheme.Codecs)
 		failedHandler := genericapifilters.Unauthorized(legacyscheme.Codecs)
 		handler = genericapifilters.WithAuthentication(handler, ls.Auth.Authenticator, failedHandler, metaserverconfig.Config.APIAudiences, nil)
+		// 必须包在 WithAuthentication 外层：认证中间件认证成功后会主动删除请求的
+		// Authorization 头（k8s.io/apiserver 标准安全行为，避免凭证被下游继续传递），
+		// 之后 unhold-upgrade 的 handler 内部还要对 MetaServer 自身发起一次自调用去查
+		// Pod，这次自调用同样要经过本机 MetaServer 的认证，需要带着原始 token——所以
+		// 必须在头被删除之前把它存进 context，供 handler 内部取用。
+		handler = common.CaptureBearerToken(handler)
 	}
 	handler = genericfilters.WithWaitGroup(handler, ls.LongRunningFunc, ls.HandlerChainWaitGroup)
 	handler = genericapifilters.WithRequestInfo(handler, server.NewRequestInfoResolver(cfg))
