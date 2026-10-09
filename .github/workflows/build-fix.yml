@@ -1,0 +1,208 @@
+# 构建 KubeEdge v1.22.2-fix3（linux/amd64）：仅用于本论文实验环境。
+#
+# 为什么需要这个 workflow：基于官方 v1.22.2（commit 6e5afec5）修复 EdgeGrant 分区期间
+# Edge Agent 调用本地 MetaServer unhold-upgrade 释放 Held Reserve 时的四层连环故障
+# （Kind 字段缺失导致同步丢失、内部自调用证书信任链错误、认证中间件删除 Authorization
+# 头导致自调用变成匿名请求；第四层 token 缓存不同步在部署配置层解决，不在本构建范围）。
+# 已用 Phase 2 capability test 完整验证：13 项全部 PASSED，含
+# release_succeeds_during_partition、held_state_survives_edgecore_restart。
+# 详见本分支根目录的改动文件：
+#   edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator/imitator.go
+#   edge/pkg/metamanager/metaserver/common/bearer_token.go（新文件）
+#   edge/pkg/metamanager/metaserver/server.go
+#   edge/pkg/metamanager/metaserver/handlerfactory/extend_unhold_upgrade.go
+#   keadm/cmd/keadm/app/cmd/util/metaclient/metaclient.go
+#
+# 为什么必须在 Linux 上带 cgo 构建：
+#   edgecore 的 meta_v2 用 go-sqlite3，需要 cgo。CGO_ENABLED=0 编出来的二进制启动即
+#   "go-sqlite3 requires cgo to work. This is a stub" 并退出（实测踩过）。
+name: Build kubeedge v1.22.2-fix3 (linux/amd64)
+
+on:
+  push:
+    branches: [edgegrant-fix1]
+    tags: ['v1.22.2-fix3*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 用于把产物挂到 Release（若仓库只允许只读 token，本步骤会失败但 artifact 仍在）
+
+env:
+  KUBEEDGE_VERSION_TAG: v1.22.2
+  ARTIFACT_VERSION: v1.22.2-fix3
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出（含 tag，KubeEdge 版本探测依赖 git describe）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.6'
+
+      - name: 校验补丁在位（四层改动均已应用）
+        run: |
+          set -euo pipefail
+
+          # 第 1 层：imitator.go 反序列化时若 Kind 缺失按资源类型反推补全（cherry-pick #6637）。
+          imi=edge/pkg/metamanager/metaserver/kubernetes/storage/sqlite/imitator/imitator.go
+          grep -q 'UnsafeResourceToKind' "$imi"
+          echo "第 1 层（imitator Kind 补全）校验通过"
+
+          # 第 2 层：unhold-upgrade 内部自调用只设置 CAFile，不再设置 CertFile/KeyFile
+          # （避免出示错误信任链的客户端证书）。KubeClientWithToken 是新增的、按 token
+          # 构造客户端的入口。
+          mc=keadm/cmd/keadm/app/cmd/util/metaclient/metaclient.go
+          grep -q 'func KubeClientWithToken(' "$mc"
+          if grep -q 'kubeConfig.TLSClientConfig.CertFile = serverCrt' "$mc"; then
+            echo "第 2 层补丁缺失：内部客户端仍在设置 CertFile（错误信任链证书）" >&2
+            exit 1
+          fi
+          echo "第 2 层（内部自调用证书信任链）校验通过"
+
+          # 第 3 层：CaptureBearerToken 中间件在认证中间件删除 Authorization 头之前，
+          # 把 token 存入 context；handler 改用 BearerTokenFromContext 取用。
+          bt=edge/pkg/metamanager/metaserver/common/bearer_token.go
+          test -f "$bt"
+          grep -q 'func CaptureBearerToken(' "$bt"
+          grep -q 'func BearerTokenFromContext(' "$bt"
+          grep -q 'common.CaptureBearerToken' edge/pkg/metamanager/metaserver/server.go
+          uh=edge/pkg/metamanager/metaserver/handlerfactory/extend_unhold_upgrade.go
+          grep -q 'common.BearerTokenFromContext' "$uh"
+          grep -q 'metaclient.KubeClientWithToken' "$uh"
+          if grep -q 'metaclient.KubeClient()' "$uh"; then
+            echo "第 3 层补丁缺失：handler 仍在用匿名的 metaclient.KubeClient()" >&2
+            exit 1
+          fi
+          echo "第 3 层（Bearer token 转发）校验通过：$(git log --oneline -1)"
+
+      - name: 构建（native amd64 + cgo）
+        env:
+          BUILD_WITH_CONTAINER: "false"
+          GOWORK: "off"
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          go version
+          gcc --version | head -1
+          hack/make-rules/build.sh admission cloudcore csidriver iptablesmanager controllermanager edgecore keadm
+          file _output/local/bin/edgecore
+
+      - name: 打包成官方 layout（keadm 可直接使用）
+        run: |
+          set -euo pipefail
+          D="kubeedge-${KUBEEDGE_VERSION_TAG}-linux-amd64"
+          rm -rf release && mkdir -p "release/${D}/cloud" "release/${D}/edge"
+          B=_output/local/bin
+          cp "$B"/admission "$B"/csidriver "$B"/iptablesmanager "$B"/controllermanager "$B"/cloudcore "release/${D}/cloud/"
+          cp "$B"/edgecore "release/${D}/edge/edgecore"
+          echo "${KUBEEDGE_VERSION_TAG}" > "release/${D}/version"
+          (cd release && tar czf "../kubeedge-${KUBEEDGE_VERSION_TAG}-linux-amd64.tar.gz" "${D}")
+          # keadm 要求的校验文件格式是"单行 SHA512"，缺了它会走交互式 [y/N] 提问
+          sha512sum "kubeedge-${KUBEEDGE_VERSION_TAG}-linux-amd64.tar.gz" | cut -d' ' -f1 \
+            > "checksum_kubeedge-${KUBEEDGE_VERSION_TAG}-linux-amd64.tar.gz.txt"
+          sha256sum "kubeedge-${KUBEEDGE_VERSION_TAG}-linux-amd64.tar.gz" | cut -d' ' -f1 \
+            > "kubeedge-${KUBEEDGE_VERSION_TAG}-linux-amd64.tar.gz.sha256"
+          sha256sum "release/${D}/edge/edgecore" | cut -d' ' -f1 > edgecore.sha256
+
+      - name: 摘要（部署脚本要固定的两个指纹）
+        run: |
+          {
+            echo "### KubeEdge ${ARTIFACT_VERSION} 构建产物"
+            echo ""
+            echo "| 项 | sha256 |"
+            echo "| --- | --- |"
+            echo "| tarball | \`$(cat kubeedge-v1.22.2-linux-amd64.tar.gz.sha256)\` |"
+            echo "| edgecore | \`$(cat edgecore.sha256)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      # ---- Docker Hub：构建 keadm 的 installation-package 镜像并推送 ----
+      #
+      # 为什么需要：keadm join 在容器模式下执行的是「Pull Images → Copy resources from the
+      # image」，它拉的就是 <image-repository>/installation-package:<kubeedge-version>，
+      # 再从容器里的 /usr/local/bin/edgecore 拷到宿主机；--tarballpath 在这条路径上不生效。
+      # 把我们的构建推成同名镜像后，keadm join --image-repository=<dockerhub用户> 就会直接
+      # 装上 fix 版 edgecore（标签必须与 --kubeedge-version 的版本串一致，即 v1.22.2）。
+      - name: 登录 Docker Hub
+        id: dockerhub
+        continue-on-error: true
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "未配置仓库 secret DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，跳过镜像推送" >&2
+            exit 1
+          fi
+          echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
+
+      - name: 构建并推送 installation-package 镜像
+        if: steps.dockerhub.outcome == 'success'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          mkdir -p image
+          cp _output/local/bin/edgecore image/edgecore
+          cp _output/local/bin/keadm image/keadm
+          cat > image/Dockerfile <<'DOCKERFILE'
+          FROM ubuntu:22.04
+          COPY edgecore /usr/local/bin/edgecore
+          COPY keadm /usr/local/bin/keadm
+          WORKDIR /etc/kubeedge
+          DOCKERFILE
+          IMAGE="${DOCKERHUB_USERNAME}/installation-package"
+          # 标签必须带 v 前缀：keadm 用 --kubeedge-version=v1.22.2 拼镜像引用
+          docker build -t "${IMAGE}:v1.22.2" image/
+          docker tag "${IMAGE}:v1.22.2" "${IMAGE}:${ARTIFACT_VERSION}"
+          docker push "${IMAGE}:v1.22.2"
+          docker push "${IMAGE}:${ARTIFACT_VERSION}"
+          {
+            echo ""
+            echo "### Docker Hub 镜像"
+            echo "- \`${IMAGE}:v1.22.2\`（keadm join --image-repository=${DOCKERHUB_USERNAME} 用的标签）"
+            echo "- \`${IMAGE}:${ARTIFACT_VERSION}\`（同一镜像的 fix 标记标签）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubeedge-${{ env.ARTIFACT_VERSION }}-linux-amd64
+          retention-days: 30
+          path: |
+            kubeedge-v1.22.2-linux-amd64.tar.gz
+            checksum_kubeedge-v1.22.2-linux-amd64.tar.gz.txt
+            kubeedge-v1.22.2-linux-amd64.tar.gz.sha256
+            edgecore.sha256
+
+      - name: 发布到 Release（${{ env.ARTIFACT_VERSION }}）
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.ARTIFACT_VERSION }}
+          name: KubeEdge ${{ env.ARTIFACT_VERSION }} (linux/amd64, 本地实验用)
+          body: |
+            基于官方 KubeEdge v1.22.2（commit 6e5afec5）修复 EdgeGrant 分区期间 Edge Agent
+            调用本地 MetaServer `unhold-upgrade` 释放 Held Reserve 时的三层连环故障：
+            imitator.go 反序列化丢失 Kind 字段导致同步消息被丢弃（cherry-pick 社区 PR
+            #6637）、内部自调用出示了错误信任链的客户端证书（tls: unknown certificate
+            authority）、认证中间件删除 Authorization 头导致内部自调用变成匿名请求
+            （401 Unauthorized）。第四层（MetaServer 本地 token 缓存不随 kubelet token
+            轮换更新）通过部署配置的 serviceAccountKeyFiles 解决，不在本构建范围。
+            已用 Phase 2 capability test 完整验证：13 项全部 PASSED。
+            仅用于本论文实验环境，非上游发布。
+          files: |
+            kubeedge-v1.22.2-linux-amd64.tar.gz
+            checksum_kubeedge-v1.22.2-linux-amd64.tar.gz.txt
+            kubeedge-v1.22.2-linux-amd64.tar.gz.sha256
+            edgecore.sha256
+          fail_on_unmatched_files: true
